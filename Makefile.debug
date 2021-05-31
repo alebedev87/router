@@ -1,0 +1,91 @@
+#
+# Inspired from https://github.com/frobware/router/blob/master/Makefile.debug
+#
+
+export GOOS=linux
+
+# options
+USE_REMOTE ?= false
+TLS_OPTS := --tls-verify=false
+
+# tools
+BUILD_TOOL ?= podman
+PUSH_TOOL ?= podman
+
+# registry
+REMOTE_REGISTRY := quay.io
+CRC_REGISTRY := default-route-openshift-image-registry.apps-crc.testing
+CRC_INTERNAL_REGISTRY := image-registry.openshift-image-registry.svc:5000
+REGISTRY ?= $(CRC_REGISTRY)
+ifeq ($(USE_REMOTE), true)
+REGISTRY = $(REMOTE_REGISTRY)
+endif
+
+# credentials
+CRC_USER := kubeadmin
+CRC_PWD := $(shell oc whoami -t)
+REMOTE_USER ?= $(USER)
+REGISTRY_USER := $(CRC_USER)
+REGISTRY_PWD := $(CRC_PWD)
+ifeq ($(USE_REMOTE), true)
+REGISTRY_USER = $(REMOTE_USER)
+REGISTRY_PWD = $(REMOTE_PWD)
+endif
+
+# project
+REMOTE_PROJECT ?= $(USER)
+CRC_PROJECT := openshift-ingress
+PROJECT ?= $(CRC_PROJECT)
+ifeq ($(USE_REMOTE), true)
+PROJECT = $(REMOTE_PROJECT)
+endif
+
+# image
+IMAGE_NAME := router
+IMAGE := $(PROJECT)/$(IMAGE_NAME)
+
+# tag
+BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
+HASH   := $(shell git rev-parse HEAD | colrm 8)
+DATE   := $(shell date +%H%M%S)
+TAG    := $(BRANCH)-g$(HASH)
+
+FULL_IMAGE := $(REGISTRY)/$(IMAGE):$(TAG)
+FULL_IMAGESTREAM := $(CRC_INTERNAL_REGISTRY)/$(IMAGE):$(TAG)
+
+img:
+	@echo $(FULL_IMAGE)
+
+# image stream
+is:
+	@echo $(FULL_IMAGESTREAM)
+
+new-openshift-router-image:
+	GO111MODULE=on GOFLAGS=-mod=vendor go build -o openshift-router -gcflags=all="-N -l" ./cmd/openshift-router
+	$(BUILD_TOOL) build -t $(IMAGE):$(TAG) -f Dockerfile.debug .
+
+login:
+	$(PUSH_TOOL) login $(TLS_OPTS) -u $(REGISTRY_USER) -p $(REGISTRY_PWD) $(REGISTRY)
+
+push:
+	$(PUSH_TOOL) tag $(IMAGE):$(TAG) $(FULL_IMAGE)
+	$(PUSH_TOOL) push $(TLS_OPTS) $(FULL_IMAGE)
+
+do-image: new-openshift-router-image push
+
+set-image:
+	oc scale --replicas 0 -n openshift-cluster-version deployments/cluster-version-operator
+	oc scale --replicas 0 -n openshift-ingress-operator deployments ingress-operator
+	oc -n openshift-ingress scale deployment --replicas=0 router-default
+	oc -n openshift-ingress patch deployment router-default -p '{"spec":{"template":{"spec":{"$setElementOrder/containers":[{"name":"router"}],"containers":[{"imagePullPolicy":"Always","name":"router"}]}}}}'
+	oc -n openshift-ingress set image deployment/router-default router=$(FULL_IMAGESTREAM)
+	oc -n openshift-ingress scale deployment --replicas=1 router-default
+
+dwim:  new-openshift-router-image push set-image
+
+reset:
+	oc scale --replicas 1 -n openshift-cluster-version deployments/cluster-version-operator
+	oc scale --replicas 1 -n openshift-ingress-operator deployments ingress-operator
+
+verify:
+	@echo DATE=$(DATE)
