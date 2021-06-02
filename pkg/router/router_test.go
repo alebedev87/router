@@ -51,7 +51,43 @@ func (h *harness) nextUID() types.UID {
 
 var h *harness
 
-var reloadInterval = time.Duration(100 * time.Millisecond)
+var reloadInterval = time.Duration(15 * time.Second)
+
+type reloadWatcher struct {
+	// send to channel or not
+	active bool
+	ch     chan bool
+	mtx    *sync.Mutex
+}
+
+func newReloadWatcher(active bool) *reloadWatcher {
+	return &reloadWatcher{
+		active: active,
+		ch:     make(chan bool),
+		mtx:    &sync.Mutex{},
+	}
+}
+
+func (w *reloadWatcher) setActive(active bool) {
+	w.mtx.Lock()
+	w.active = active
+	w.mtx.Unlock()
+}
+
+func (w *reloadWatcher) checkAndSend(msg bool) {
+	w.mtx.Lock()
+	if w.active {
+		w.ch <- msg
+	}
+	w.mtx.Unlock()
+}
+
+func (w *reloadWatcher) reloadFn(shutdown bool) error {
+	w.checkAndSend(shutdown)
+	return nil
+}
+
+var rwatcher = newReloadWatcher(false)
 
 func TestMain(m *testing.M) {
 	logFlags := flag.FlagSet{}
@@ -98,7 +134,7 @@ func TestMain(m *testing.M) {
 	pluginCfg := templateplugin.TemplatePluginConfig{
 		WorkingDir:            workdir,
 		DefaultCertificateDir: workdir,
-		ReloadFn:              func(shutdown bool) error { return nil },
+		ReloadFn:              rwatcher.reloadFn,
 		TemplatePath:          "../../images/router/haproxy/conf/haproxy-config.template",
 		ReloadInterval:        reloadInterval,
 	}
@@ -212,16 +248,30 @@ func TestConfigTemplateExecution(t *testing.T) {
 		}
 	}
 
-	// let the router reload
-	time.Sleep(reloadInterval * 2)
+	// activate the reload watcher
+	rwatcher.setActive(true)
+	defer rwatcher.setActive(false)
 
-	stopCh <- struct{}{}
-	wg.Wait()
+	for {
+		select {
+		case <-rwatcher.ch:
+			// got the reload config event: config was successfully written
+			t.Log("Router was successfully reloaded")
+			return
+		case <-time.After(reloadInterval * 2):
+			t.Log("Timed out waiting for the config reload")
 
-	// check for errors
-	for _, e := range caughtErrors {
-		if strings.Contains(e.Error(), "error executing template") {
-			t.Fatalf("Template execution failed: %v", e)
+			// stop watching for errors
+			stopCh <- struct{}{}
+			wg.Wait()
+
+			// check the errors
+			for _, e := range caughtErrors {
+				if strings.Contains(e.Error(), "error executing template") {
+					t.Fatalf("Template execution failed: %v", e)
+				}
+			}
+			t.Fatal("Config reload failed for unknown reason")
 		}
 	}
 }
