@@ -855,6 +855,13 @@ func (r *templateRouter) dynamicallyReplaceEndpoints(id ServiceUnitKey, service 
 
 	log.V(4).Info("replacing endpoints dynamically for service", "service", id)
 
+	for _, ep := range service.EndpointTable {
+		if ep.NoHealthCheck {
+			log.V(2).Info("router will reload as the ConfigManager could not dynamically replace endpoints with disabled health check (idled service)", "service", id, "endpointIP", ep.IP, "endpointPort", ep.Port, "endpointsLen", len(service.EndpointTable))
+			return false
+		}
+	}
+
 	// Update each of the routes that reference this service unit.
 	for backendKey := range service.ServiceAliasAssociations {
 		cfg, ok := r.state[backendKey]
